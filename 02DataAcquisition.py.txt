@@ -1,0 +1,259 @@
+"""
+================================================================================
+SCRIPT 02 — DATA ACQUISITION & SIGNAL DETRENDING
+================================================================================
+Thesis: Thermodynamic Analysis and Modeling of Blackbody Radiation in
+        Eclipsing Binary Systems Using Space-Based Photometry
+
+Methodology Step 4.2:
+    Connects to MAST via lightkurve, downloads TESS Target Pixel Files (TPFs)
+    for each selected target, performs custom aperture photometry, applies
+    PCA-based detrending via scikit-learn, and produces clean normalized
+    phase-folded light curves ready for geometric modeling.
+
+Dependencies:
+    pip install lightkurve scikit-learn numpy matplotlib astropy
+
+Inputs:
+    neglected_targets.csv  — output from Script 01
+
+Outputs:
+    lc_<starname>_clean.fits  — detrended, normalized light curve per target
+    lc_<starname>_folded.fits — phase-folded light curve per target
+    plots/lc_<starname>_raw_vs_clean.png
+================================================================================
+"""
+
+import csv
+import os
+import warnings
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import lightkurve as lk
+from sklearn.decomposition import PCA
+
+warnings.filterwarnings("ignore")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 1: CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+INPUT_FILE       = "neglected_targets.csv"
+PLOT_DIR         = "plots"
+os.makedirs(PLOT_DIR, exist_ok=True)
+
+N_PCA_COMPONENTS = 5      # PCA components for background systematics
+SIGMA_CLIP       = 3.0    # sigma threshold for outlier removal
+
+# Target flatten window in HOURS
+FLATTEN_WINDOW_HOURS = 13.0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 2: LOAD TARGET LIST
+# ─────────────────────────────────────────────────────────────────────────────
+
+targets = []
+try:
+    with open(INPUT_FILE, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            targets.append({
+                "name":   row["name"],
+                "type":   row["type"],
+                "period": float(row["period"]),
+            })
+    print(f"Loaded {len(targets)} targets from {INPUT_FILE}")
+except FileNotFoundError:
+    print(f"ERROR: {INPUT_FILE} not found. Please run Script 01 first.")
+    exit()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 3: MAIN PROCESSING LOOP
+# ─────────────────────────────────────────────────────────────────────────────
+
+for target in targets:
+    name   = target["name"]
+    period = target["period"]
+
+    print("\n" + "=" * 70)
+    print(f"PROCESSING: {name}   (P = {period:.4f} d)")
+    print("=" * 70)
+
+    # ── 3A: DOWNLOAD TARGET PIXEL FILES FROM MAST ────────────────────────────
+    print(f"\n  [3A] Searching MAST for TESS TPFs: {name}")
+
+    search_result = lk.search_targetpixelfile(name, mission="TESS", exptime=120)
+    
+    # TWEAK: Relax the fallback search to grab ANY available cadence if 2-min fails
+    if len(search_result) == 0:
+        print("  No 2-min cadence data found. Trying any available fallback cadence...")
+        search_result = lk.search_targetpixelfile(name, mission="TESS")
+
+    if len(search_result) == 0:
+        print(f"  WARNING: No TPF data found for {name} at any cadence. Skipping.")
+        continue
+
+    print(f"  Found {len(search_result)} TPF(s). Downloading first available sector...")
+    try:
+        tpf = search_result[0].download()
+    except Exception as e:
+        print(f"  WARNING: Download failed for {name} ({e}). Skipping.")
+        continue
+
+    # Dynamically determine the actual cadence used
+    cadence_used = tpf.time[1].value - tpf.time[0].value 
+    cadence_used_sec = cadence_used * 86400  # convert days to seconds
+
+    print(f"  TPF downloaded: Sector {tpf.sector}, "
+          f"Cadence: ~{cadence_used_sec:.0f}s, Shape: {tpf.shape}")
+
+    # ── 3B: CUSTOM APERTURE PHOTOMETRY ───────────────────────────────────────
+    print(f"\n  [3B] Performing custom aperture photometry...")
+
+    aperture_mask = tpf.pipeline_mask
+    
+    # TWEAK: Prevent crash if the pipeline didn't provide a default mask
+    if not aperture_mask.any():
+        print("  WARNING: Pipeline mask empty. Generating threshold mask...")
+        aperture_mask = tpf.create_threshold_mask()
+
+    raw_lc = tpf.to_lightcurve(aperture_mask=aperture_mask)
+    print(f"  Raw light curve: {len(raw_lc)} data points")
+
+    # ── 3C: PCA-BASED BACKGROUND DETRENDING ──────────────────────────────────
+    print(f"\n  [3C] Applying PCA detrending...")
+
+    background_mask = ~aperture_mask & np.isfinite(tpf.flux.value[0])
+    bkg_flux        = tpf.flux.value[:, background_mask]
+
+    # Replace NaNs with column medians for PCA stability
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        col_medians = np.nanmedian(bkg_flux, axis=0)
+        
+    # Prevent completely dead pixels (all NaNs) from crashing the PCA
+    col_medians[np.isnan(col_medians)] = 0.0  
+
+    nan_mask = ~np.isfinite(bkg_flux)
+    bkg_flux[nan_mask] = np.take(col_medians, np.where(nan_mask)[1])
+
+    # TWEAK: Ensure we don't ask for more PCA components than we have pixels
+    actual_pca_comps = min(N_PCA_COMPONENTS, bkg_flux.shape[1])
+    
+    if actual_pca_comps == 0:
+        print("  WARNING: No background pixels available for PCA. Skipping detrending.")
+        corrected_flux = raw_lc.flux.value.copy()
+    else:
+        pca = PCA(n_components=actual_pca_comps)
+        pca.fit(bkg_flux)
+        systematic_components = pca.transform(bkg_flux)
+
+        print(f"  PCA variance explained by {actual_pca_comps} components: "
+              f"{pca.explained_variance_ratio_.sum() * 100:.1f}%")
+
+        target_flux = raw_lc.flux.value.copy()
+        finite_mask = np.isfinite(target_flux)
+
+        design_matrix = np.column_stack([
+            np.ones(systematic_components.shape[0]),
+            systematic_components
+        ])
+
+        coeffs, _, _, _ = np.linalg.lstsq(
+            design_matrix[finite_mask],
+            target_flux[finite_mask],
+            rcond=None
+        )
+
+        systematic_model = design_matrix @ coeffs - coeffs[0]
+        corrected_flux   = target_flux - systematic_model
+
+    # Write corrected flux back into the LightCurve object
+    pca_corrected_lc        = raw_lc.copy()
+    pca_corrected_lc.flux   = corrected_flux * raw_lc.flux.unit
+    pca_corrected_lc        = pca_corrected_lc.remove_nans()
+
+    # ── 3D: SIGMA CLIPPING ────────────────────────────────────────────────────
+    print(f"\n  [3D] Sigma-clipping outliers (threshold: {SIGMA_CLIP}σ)...")
+
+    clipped_lc = pca_corrected_lc.remove_outliers(sigma=SIGMA_CLIP)
+    n_removed  = len(pca_corrected_lc) - len(clipped_lc)
+    print(f"  Removed {n_removed} outlier cadences "
+          f"({n_removed / len(pca_corrected_lc) * 100:.2f}%)")
+
+    # ── 3E: FLATTEN — SAVITZKY-GOLAY HIGH-PASS FILTER ────────────────────────
+    cadence_minutes  = cadence_used_sec / 60.0
+    window_cadences  = int(FLATTEN_WINDOW_HOURS * 60.0 / cadence_minutes)
+    if window_cadences % 2 == 0:     
+        window_cadences += 1
+    window_cadences = max(window_cadences, 11)   
+
+    print(f"\n  [3E] Flattening with Savitzky-Golay filter "
+          f"(window = {window_cadences} cadences "
+          f"= {FLATTEN_WINDOW_HOURS:.1f} h at {cadence_minutes:.0f}-min cadence)...")
+
+    flat_lc, trend = clipped_lc.flatten(
+        window_length=window_cadences,
+        return_trend=True,
+        break_tolerance=5
+    )
+
+    print(f"  Normalized light curve: {len(flat_lc)} data points, "
+          f"median flux = {np.nanmedian(flat_lc.flux.value):.6f}")
+
+    # ── 3F: PHASE-FOLD THE LIGHT CURVE ───────────────────────────────────────
+    print(f"\n  [3F] Phase-folding at P = {period:.6f} d...")
+
+    folded_lc = flat_lc.fold(period=period)
+
+    print(f"  Phase-folded: {len(folded_lc)} points across the orbital cycle")
+
+    # ── 3G: SAVE OUTPUT FILES ─────────────────────────────────────────────────
+    safe_name   = name.replace(" ", "_")
+    clean_file  = f"lc_{safe_name}_clean.fits"
+    folded_file = f"lc_{safe_name}_folded.fits"
+
+    flat_lc.to_fits(clean_file,    overwrite=True)
+    folded_lc.to_fits(folded_file, overwrite=True)
+    print(f"\n  Saved: {clean_file}")
+    print(f"  Saved: {folded_file}")
+
+    with open(f"cadence_{safe_name}.txt", "w") as f:
+        f.write(f"{cadence_used_sec}\n")
+
+    # ── 3H: DIAGNOSTIC PLOT ──────────────────────────────────────────────────
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10))
+    fig.suptitle(
+        f"{name} — TESS Light Curve Processing (Sector {tpf.sector})",
+        fontsize=13, fontweight="bold"
+    )
+
+    axes[0].plot(raw_lc.time.value, raw_lc.flux.value, "k.", ms=1.5, alpha=0.5)
+    axes[0].set_ylabel("Raw Flux [e⁻/s]")
+    axes[0].set_title("(a) Raw aperture photometry")
+
+    axes[1].plot(flat_lc.time.value, flat_lc.flux.value, "b.", ms=1.5, alpha=0.6)
+    axes[1].axhline(1.0, color="r", lw=0.8, ls="--", label="Unity")
+    axes[1].set_ylabel("Normalized Flux")
+    axes[1].set_title(
+        f"(b) PCA-corrected, sigma-clipped, normalised flux  "
+        f"[SG window = {window_cadences} cad]"
+    )
+    axes[1].legend(fontsize=8)
+
+    axes[2].plot(folded_lc.phase.value, folded_lc.flux.value, "g.", ms=1.5, alpha=0.6)
+    axes[2].set_xlabel("Orbital Phase φ")
+    axes[2].set_ylabel("Normalized Flux")
+    axes[2].set_title(f"(c) Phase-folded light curve (P = {period:.4f} d)")
+
+    plt.tight_layout()
+    plot_path = os.path.join(PLOT_DIR, f"lc_{safe_name}_raw_vs_clean.png")
+    plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Plot saved: {plot_path}")
+
+print("\n" + "=" * 70)
+print("SCRIPT 02 COMPLETE — All targets processed.")
+print("=" * 70)
