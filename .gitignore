@@ -1,0 +1,24 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Data products (Large files)
+*.phoebe
+*.fits
+*.csv
+!tominima_*.csv
+!results_*.csv
+
+# Logs
+*.txt
+!Expansion_Notes.txt
+!README.md
+
+# Environments
+env/
+venv/
+.env
+
+# Plot output
+plots/
